@@ -1,0 +1,4 @@
+/backend
+*.test
+coverage.out
+.env
