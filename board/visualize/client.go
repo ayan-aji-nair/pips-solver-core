@@ -1,363 +1,694 @@
 package visualize
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 
-	"github.com/charmbracelet/bubbles/help"
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/textinput"
+	"pips-solver/backend/board/requests"
+	"pips-solver/backend/board/solver"
+	"pips-solver/backend/board/types"
+
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/mattn/go-runewidth"
-
-	"pips-solver/backend/board/types"
+	"github.com/joho/godotenv"
 )
 
 type Puzzle = types.Puzzle
 type Cell = types.Cell
+type PuzzlePayload = types.PuzzlePayload
 
 type screen int
 
 const (
 	screenDateSearch screen = iota
+	screenLoading
+	screenDifficulty
 	screenGame
+	screenSolving
 )
-
-type Board struct {
-	Grid [][]string
-}
-
-func NewBoard(p Puzzle) *Board {
-	maxRow := 0
-	maxCol := 0
-
-	for _, region := range p.Regions {
-		for _, coord := range region.Indices {
-			if len(coord) < 2 {
-				continue
-			}
-
-			if coord[0] > maxRow {
-				maxRow = coord[0]
-			}
-
-			if coord[1] > maxCol {
-				maxCol = coord[1]
-			}
-		}
-	}
-
-	grid := make([][]string, maxRow+1)
-	for r := range grid {
-		grid[r] = make([]string, maxCol+1)
-	}
-
-	return &Board{Grid: grid}
-}
 
 type Model struct {
 	screen screen
 
-	dateInput textinput.Model
-	help      help.Model
-	keys      keyMap
+	dateInput string
+	message   string
+	err       error
 
-	selectedDate string
-	cursor       Cell
-
-	width  int
-	height int
+	payload *types.PuzzlePayload
+	game    *GameState
 }
 
-func NewModel() Model {
-	input := textinput.New()
-	input.Placeholder = "YYYY-MM-DD"
-	input.Focus()
-	input.CharLimit = 10
-	input.Width = 12
-
-	return Model{
-		screen:    screenDateSearch,
-		dateInput: input,
-		help:      help.New(),
-		keys:      newKeyMap(),
-		cursor:    Cell{R: 0, C: 0},
-	}
+type puzzleLoadedMsg struct {
+	Payload *types.PuzzlePayload
 }
+
+type puzzleLoadFailedMsg struct {
+	Err error
+}
+
+type solverFinishedMsg struct {
+	Placements []types.Placement
+	Duration   time.Duration
+}
+
+type solverFailedMsg struct {
+	Err      error
+	Duration time.Duration
+}
+
+var (
+	titleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Padding(0, 1)
+
+	panelStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			Padding(1, 2)
+
+	activePanelStyle = lipgloss.NewStyle().
+				Border(lipgloss.ThickBorder()).
+				Padding(1, 2)
+
+	mutedStyle = lipgloss.NewStyle().
+			Faint(true)
+
+	errorStyle = lipgloss.NewStyle().
+			Bold(true)
+
+	helpStyle = lipgloss.NewStyle().
+			Faint(true)
+)
 
 func Run() error {
-	_, err := tea.NewProgram(NewModel(), tea.WithAltScreen()).Run()
+	_ = godotenv.Load()
+
+	p := tea.NewProgram(NewModel(), tea.WithAltScreen())
+	_, err := p.Run()
 	return err
 }
 
+func NewModel() Model {
+	return Model{
+		screen:    screenDateSearch,
+		dateInput: "",
+		message:   "Enter a date as YYYY-MM-DD, or press enter for today.",
+	}
+}
+
 func (m Model) Init() tea.Cmd {
-	return textinput.Blink
+	return nil
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		return m, nil
-
-	case tea.KeyMsg:
-		switch {
-		case key.Matches(msg, m.keys.Quit):
-			return m, tea.Quit
-		}
-	}
-
 	switch m.screen {
 	case screenDateSearch:
 		return m.updateDateSearch(msg)
+	case screenLoading:
+		return m.updateLoading(msg)
+	case screenDifficulty:
+		return m.updateDifficulty(msg)
 	case screenGame:
 		return m.updateGame(msg)
+	case screenSolving:
+		return m.updateSolving(msg)
 	default:
 		return m, nil
+	}
+}
+
+func (m Model) View() string {
+	switch m.screen {
+	case screenDateSearch:
+		return m.viewDateSearch()
+	case screenLoading:
+		return m.viewLoading()
+	case screenDifficulty:
+		return m.viewDifficulty()
+	case screenGame:
+		return m.viewGame(false)
+	case screenSolving:
+		return m.viewGame(true)
+	default:
+		return "unknown screen"
 	}
 }
 
 func (m Model) updateDateSearch(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if key.Matches(msg, m.keys.Submit) {
-			m.selectedDate = strings.TrimSpace(m.dateInput.Value())
-			if m.selectedDate == "" {
-				m.selectedDate = "today"
+		switch msg.Type {
+		case tea.KeyCtrlC, tea.KeyEsc:
+			return m, tea.Quit
+
+		case tea.KeyEnter:
+			date := strings.TrimSpace(m.dateInput)
+			if date == "" {
+				date = time.Now().Format("2006-01-02")
 			}
 
-			m.screen = screenGame
-			m.cursor = Cell{R: 0, C: 0}
-			return m, nil
-		}
-	}
+			m.dateInput = date
+			m.message = "Loading puzzle..."
+			m.err = nil
+			m.screen = screenLoading
 
-	var cmd tea.Cmd
-	m.dateInput, cmd = m.dateInput.Update(msg)
-	return m, cmd
-}
+			return m, loadPuzzleCmd(date)
 
-func (m Model) updateGame(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch {
-		case key.Matches(msg, m.keys.Back):
-			m.screen = screenDateSearch
-			m.dateInput.Focus()
-			return m, nil
-		case key.Matches(msg, m.keys.Left):
-			if m.cursor.C > 0 {
-				m.cursor.C--
+		case tea.KeyBackspace:
+			if len(m.dateInput) > 0 {
+				m.dateInput = m.dateInput[:len(m.dateInput)-1]
 			}
-		case key.Matches(msg, m.keys.Right):
-			if m.cursor.C < 3 {
-				m.cursor.C++
-			}
-		case key.Matches(msg, m.keys.Up):
-			if m.cursor.R > 0 {
-				m.cursor.R--
-			}
-		case key.Matches(msg, m.keys.Down):
-			if m.cursor.R < 3 {
-				m.cursor.R++
-			}
+
+		case tea.KeyRunes:
+			m.dateInput += string(msg.Runes)
 		}
 	}
 
 	return m, nil
 }
 
-func (m Model) View() string {
-	switch m.screen {
-	case screenDateSearch:
-		return m.dateSearchView()
-	case screenGame:
-		return m.gameView()
+func (m Model) updateLoading(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		if msg.Type == tea.KeyCtrlC || msg.Type == tea.KeyEsc {
+			return m, tea.Quit
+		}
+
+	case puzzleLoadedMsg:
+		m.payload = msg.Payload
+		m.err = nil
+		m.message = "Choose difficulty: e = easy, m = medium, h = hard."
+		m.screen = screenDifficulty
+		return m, nil
+
+	case puzzleLoadFailedMsg:
+		m.err = msg.Err
+		m.message = "Failed to load puzzle. Edit the date and try again."
+		m.screen = screenDateSearch
+		return m, nil
+	}
+
+	return m, nil
+}
+
+func (m Model) updateDifficulty(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "esc":
+			return m, tea.Quit
+
+		case "d", "backspace":
+			m.screen = screenDateSearch
+			m.message = "Enter a date as YYYY-MM-DD, or press enter for today."
+			return m, nil
+
+		case "e", "E":
+			return m.buildGameForDifficulty("easy")
+
+		case "m", "M":
+			return m.buildGameForDifficulty("medium")
+
+		case "h", "H", "enter":
+			return m.buildGameForDifficulty("hard")
+		}
+	}
+
+	return m, nil
+}
+
+func (m Model) buildGameForDifficulty(difficulty string) (tea.Model, tea.Cmd) {
+	if m.payload == nil {
+		m.err = fmt.Errorf("no puzzle payload loaded")
+		m.message = "No puzzle loaded. Return to date search and try again."
+		m.screen = screenDateSearch
+		return m, nil
+	}
+
+	var puzzle types.Puzzle
+
+	switch difficulty {
+	case "easy":
+		puzzle = m.payload.Data.Easy
+	case "medium":
+		puzzle = m.payload.Data.Medium
+	case "hard":
+		puzzle = m.payload.Data.Hard
 	default:
-		return ""
+		m.err = fmt.Errorf("unknown difficulty %q", difficulty)
+		m.message = "Unknown difficulty."
+		return m, nil
+	}
+
+	game, err := NewGameState(m.dateInput, difficulty, puzzle)
+	if err != nil {
+		m.err = err
+		m.message = "Failed to build game state."
+		return m, nil
+	}
+
+	m.game = game
+	m.err = nil
+	m.message = ""
+	m.screen = screenGame
+
+	return m, nil
+}
+
+func (m Model) updateGame(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.game == nil {
+		m.screen = screenDateSearch
+		m.message = "No game loaded."
+		return m, nil
+	}
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "esc":
+			return m, tea.Quit
+
+		case "d":
+			m.screen = screenDifficulty
+			m.message = "Choose difficulty: e = easy, m = medium, h = hard."
+			return m, nil
+
+		case "left", "h":
+			moveCursor(m.game, 0, -1)
+
+		case "right", "l":
+			moveCursor(m.game, 0, 1)
+
+		case "up", "k":
+			moveCursor(m.game, -1, 0)
+
+		case "down", "j":
+			moveCursor(m.game, 1, 0)
+
+		case "tab":
+			selectNextUnplacedDomino(m.game)
+
+		case "shift+tab":
+			selectPrevUnplacedDomino(m.game)
+
+		case "r":
+			m.game.Rotate()
+
+		case "f":
+			m.game.FlipSelected()
+
+		case " ", "enter":
+			if err := m.game.PlaceSelected(); err != nil {
+				m.game.Message = err.Error()
+			}
+
+		case "x", "backspace":
+			if err := m.game.RemoveAtCursor(); err != nil {
+				m.game.Message = err.Error()
+			}
+
+		case "v":
+			result := VerifyAgainstAPISolution(
+				m.game.Puzzle,
+				m.game.CurrentPlacements(),
+			)
+
+			if result.MatchesAPISolution {
+				m.game.Message = "Verified: matches API solution."
+			} else {
+				m.game.Message = fmt.Sprintf(
+					"Does not match API solution: missing %d edge(s), extra %d edge(s).",
+					len(result.MissingEdges),
+					len(result.ExtraEdges),
+				)
+			}
+
+		case "s":
+			m.game.Message = "Solving..."
+			m.screen = screenSolving
+			return m, runSolverCmd(m.game.Puzzle)
+		}
+
+		if n, ok := numberKey(msg.String()); ok {
+			selectVisibleDomino(m.game, n)
+		}
+	}
+
+	return m, nil
+}
+
+func (m Model) updateSolving(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.game == nil {
+		m.screen = screenDateSearch
+		m.message = "No game loaded."
+		return m, nil
+	}
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" {
+			return m, tea.Quit
+		}
+
+	case solverFinishedMsg:
+		m.screen = screenGame
+
+		if err := applyPlacementsToGame(m.game, msg.Placements); err != nil {
+			m.game.Message = fmt.Sprintf("Solver returned invalid placements: %v", err)
+			return m, nil
+		}
+
+		result := VerifyAgainstAPISolution(m.game.Puzzle, msg.Placements)
+
+		if result.MatchesAPISolution {
+			m.game.Message = fmt.Sprintf("Solved in %s. Matches API solution.", msg.Duration.Round(time.Millisecond))
+		} else {
+			m.game.Message = fmt.Sprintf(
+				"Solved in %s, but differs from API layout: missing %d, extra %d.",
+				msg.Duration.Round(time.Millisecond),
+				len(result.MissingEdges),
+				len(result.ExtraEdges),
+			)
+		}
+
+		return m, nil
+
+	case solverFailedMsg:
+		m.screen = screenGame
+		m.game.Message = fmt.Sprintf("Solver failed after %s: %v", msg.Duration.Round(time.Millisecond), msg.Err)
+		return m, nil
+	}
+
+	return m, nil
+}
+
+func loadPuzzleCmd(date string) tea.Cmd {
+	return func() tea.Msg {
+		baseURL := os.Getenv("BASE_URL")
+		token := os.Getenv("TOKEN")
+
+		if baseURL == "" {
+			return puzzleLoadFailedMsg{Err: fmt.Errorf("BASE_URL is not set")}
+		}
+
+		if token == "" {
+			return puzzleLoadFailedMsg{Err: fmt.Errorf("TOKEN is not set")}
+		}
+
+		http_client := &http.Client{
+			Timeout: 10 * time.Second,
+		}
+
+		client, _ := requests.NewClient(baseURL, token, http_client)
+
+		ctx := context.Background()
+		payload, err := client.GetPuzzles(ctx, date)
+		if err != nil {
+			return puzzleLoadFailedMsg{Err: err}
+		}
+
+		return puzzleLoadedMsg{Payload: payload}
 	}
 }
 
-func (m Model) dateSearchView() string {
-	panel := lipgloss.JoinVertical(
-		lipgloss.Left,
-		titleStyle.Render("Pips"),
-		mutedStyle.Render("Choose a puzzle date."),
-		"",
-		labelStyle.Render("Date"),
-		m.dateInput.View(),
-	)
+func runSolverCmd(p types.Puzzle) tea.Cmd {
+	return func() tea.Msg {
+		start := time.Now()
 
-	return pageStyle.
-		Width(contentWidth(m.width)).
-		Render(lipgloss.JoinVertical(lipgloss.Left, panel, "", footerStyle.Render(m.help.View(m.keys))))
+		model, err := solver.NewILPModel(p)
+		if err != nil {
+			return solverFailedMsg{
+				Err:      err,
+				Duration: time.Since(start),
+			}
+		}
+
+		placements, err := model.Solve()
+		if err != nil {
+			return solverFailedMsg{
+				Err:      err,
+				Duration: time.Since(start),
+			}
+		}
+
+		return solverFinishedMsg{
+			Placements: placements,
+			Duration:   time.Since(start),
+		}
+	}
 }
 
-func (m Model) gameView() string {
-	header := lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		titleStyle.Render("Pips"),
-		mutedStyle.MarginLeft(2).Render(fmt.Sprintf("Date: %s", m.selectedDate)),
+func (m Model) viewDateSearch() string {
+	var b strings.Builder
+
+	b.WriteString(titleStyle.Render("Pips TUI"))
+	b.WriteString("\n\n")
+	b.WriteString("Date: ")
+	b.WriteString(activePanelStyle.Render(m.dateInput))
+	b.WriteString("\n\n")
+	b.WriteString(m.message)
+
+	if m.err != nil {
+		b.WriteString("\n\n")
+		b.WriteString(errorStyle.Render(m.err.Error()))
+	}
+
+	b.WriteString("\n\n")
+	b.WriteString(helpStyle.Render("enter: load today/date • backspace: edit • esc/ctrl+c: quit"))
+
+	return b.String()
+}
+
+func (m Model) viewLoading() string {
+	return titleStyle.Render("Pips TUI") +
+		"\n\n" +
+		panelStyle.Render(fmt.Sprintf("Loading puzzle for %s...", m.dateInput)) +
+		"\n\n" +
+		helpStyle.Render("esc/ctrl+c: quit")
+}
+
+func (m Model) viewDifficulty() string {
+	var b strings.Builder
+
+	b.WriteString(titleStyle.Render("Pips TUI"))
+	b.WriteString("\n\n")
+	b.WriteString(panelStyle.Render(
+		fmt.Sprintf(
+			"Loaded puzzle for %s\n\nChoose difficulty:\n\n  e  Easy\n  m  Medium\n  h  Hard\n\nPress enter for hard.",
+			m.dateInput,
+		),
+	))
+
+	if m.err != nil {
+		b.WriteString("\n\n")
+		b.WriteString(errorStyle.Render(m.err.Error()))
+	}
+
+	b.WriteString("\n\n")
+	b.WriteString(helpStyle.Render("d/backspace: date search • esc/ctrl+c: quit"))
+
+	return b.String()
+}
+
+func (m Model) viewGame(solving bool) string {
+	if m.game == nil {
+		return "No game loaded."
+	}
+
+	header := titleStyle.Render(
+		fmt.Sprintf(
+			"Pips TUI — %s — %s",
+			m.game.Date,
+			strings.Title(m.game.Difficulty),
+		),
 	)
+
+	board := renderBoard(m.game)
+	side := renderSidePanel(m.game)
 
 	body := lipgloss.JoinHorizontal(
 		lipgloss.Top,
-		m.renderBoard(),
-		m.renderSidePanel(),
+		board,
+		"  ",
+		side,
 	)
 
-	return pageStyle.
-		Width(contentWidth(m.width)).
-		Render(lipgloss.JoinVertical(lipgloss.Left, header, "", body, "", footerStyle.Render(m.help.View(m.keys))))
+	status := m.game.Message
+	if status == "" {
+		status = m.message
+	}
+	if solving {
+		status = "Solving..."
+	}
+
+	footer := helpStyle.Render(
+		"h/j/k/l or arrows: move • tab: next domino • shift+tab: prev • 1-9: select • r: rotate • f: flip • space/enter: place • x: remove • v: verify • s: solve • d: difficulty • ctrl+c: quit",
+	)
+
+	return header + "\n\n" + body + "\n\n" + panelStyle.Render(status) + "\n\n" + footer
 }
 
-func (m Model) renderBoard() string {
-	rows := make([]string, 0, 4)
+func renderBoard(g *GameState) string {
+	var rowViews []string
 
-	for r := 0; r < 4; r++ {
-		cells := make([]string, 0, 4)
+	for r := g.Geometry.MinRow; r <= g.Geometry.MaxRow; r++ {
+		var cellViews []string
 
-		for c := 0; c < 4; c++ {
-			label := " "
-			if r == 0 && c == 0 {
-				label = "S8"
-			}
-			if r == 1 && c == 2 {
-				label = "<6"
-			}
-			if r == 2 && c == 1 {
-				label = "!="
-			}
+		for c := g.Geometry.MinCol; c <= g.Geometry.MaxCol; c++ {
+			cell := types.Cell{R: r, C: c}
 
-			value := " "
-			if r == m.cursor.R && c == m.cursor.C {
-				value = "•"
+			if !g.Geometry.ExistingCells[cell] {
+				cellViews = append(cellViews, lipgloss.NewStyle().
+					Width(8).
+					Height(4).
+					Render(""))
+				continue
 			}
 
-			style := cellStyle
-			if r == m.cursor.R && c == m.cursor.C {
-				style = cursorCellStyle
-			}
-
-			cells = append(cells, style.Render(centerCell(value), centerCell(label)))
+			cellViews = append(cellViews, renderCell(g, cell))
 		}
 
-		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, cells...))
+		rowViews = append(rowViews, lipgloss.JoinHorizontal(lipgloss.Top, cellViews...))
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+	return strings.Join(rowViews, "\n")
 }
 
-func (m Model) renderSidePanel() string {
-	lines := []string{
-		sideTitleStyle.Render("Dominoes"),
-		mutedStyle.Render("[0|0] [1|2] [3|4]"),
-		"",
-		sideTitleStyle.Render("Regions"),
-		mutedStyle.Render("S8  sum equals 8"),
-		mutedStyle.Render("<6  sum less than 6"),
-		mutedStyle.Render("!=  all values differ"),
+func renderCell(g *GameState, cell types.Cell) string {
+	cs := g.Cells[cell]
+
+	value := "."
+	if cs.Value != nil {
+		value = strconv.Itoa(*cs.Value)
 	}
 
-	return sidePanelStyle.Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
-}
-
-func centerCell(s string) string {
-	width := runewidth.StringWidth(s)
-	if width >= 5 {
-		return s
+	dominoText := ""
+	if cs.DominoID != nil {
+		dominoText = fmt.Sprintf("D%d", *cs.DominoID+1)
 	}
 
-	left := (5 - width) / 2
-	right := 5 - width - left
-	return strings.Repeat(" ", left) + s + strings.Repeat(" ", right)
-}
+	content := fmt.Sprintf(
+		"  %s  \nR%d %s",
+		value,
+		cs.RegionID+1,
+		dominoText,
+	)
 
-func contentWidth(width int) int {
-	if width <= 0 {
-		return 80
+	style := lipgloss.NewStyle().
+		Width(7).
+		Height(3).
+		Align(lipgloss.Center).
+		Border(lipgloss.NormalBorder())
+
+	if cell == g.Cursor {
+		style = style.Border(lipgloss.ThickBorder())
 	}
 
-	if width < 48 {
-		return width
+	return style.Render(content)
+}
+
+func renderSidePanel(g *GameState) string {
+	var b strings.Builder
+
+	b.WriteString("Dominoes\n")
+	b.WriteString(renderDominoTray(g))
+	b.WriteString("\n\n")
+	b.WriteString("Regions\n")
+	b.WriteString(renderRegionList(g))
+	b.WriteString("\n\n")
+	b.WriteString("Cursor\n")
+	b.WriteString(fmt.Sprintf("r%dc%d\n", g.Cursor.R, g.Cursor.C))
+	b.WriteString("\n")
+	b.WriteString("Orientation\n")
+	b.WriteString(orientationName(g.Orientation))
+
+	return panelStyle.Width(38).Render(b.String())
+}
+
+func renderDominoTray(g *GameState) string {
+	var b strings.Builder
+
+	visible := 0
+
+	for i, d := range g.Dominoes {
+		status := " "
+		if d.Placed {
+			status = "x"
+		}
+
+		prefix := " "
+		if i == g.SelectedDominoID {
+			prefix = ">"
+		}
+
+		displayNumber := "-"
+		if !d.Placed {
+			visible++
+			if visible <= 9 {
+				displayNumber = strconv.Itoa(visible)
+			}
+		}
+
+		b.WriteString(fmt.Sprintf(
+			"%s %s [%s] %d|%d  %s\n",
+			prefix,
+			displayNumber,
+			status,
+			d.V1,
+			d.V2,
+			dominoLocationText(d),
+		))
 	}
 
-	return 80
-}
-
-type keyMap struct {
-	Submit key.Binding
-	Back   key.Binding
-	Quit   key.Binding
-	Left   key.Binding
-	Right  key.Binding
-	Up     key.Binding
-	Down   key.Binding
-}
-
-func newKeyMap() keyMap {
-	return keyMap{
-		Submit: key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "select")),
-		Back:   key.NewBinding(key.WithKeys("d", "esc"), key.WithHelp("d/esc", "date")),
-		Quit:   key.NewBinding(key.WithKeys("ctrl+c"), key.WithHelp("ctrl+c", "quit")),
-		Left:   key.NewBinding(key.WithKeys("left", "h"), key.WithHelp("←/h", "left")),
-		Right:  key.NewBinding(key.WithKeys("right", "l"), key.WithHelp("→/l", "right")),
-		Up:     key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
-		Down:   key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
+	if len(g.Dominoes) == 0 {
+		b.WriteString(mutedStyle.Render("No dominoes"))
 	}
+
+	return b.String()
 }
 
-func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Submit, k.Back, k.Quit}
-}
-
-func (k keyMap) FullHelp() [][]key.Binding {
-	return [][]key.Binding{
-		{k.Left, k.Right, k.Up, k.Down},
-		{k.Submit, k.Back, k.Quit},
+func dominoLocationText(d DominoState) string {
+	if !d.Placed || d.C1 == nil || d.C2 == nil {
+		return ""
 	}
+
+	return fmt.Sprintf(
+		"r%dc%d-r%dc%d",
+		d.C1.R,
+		d.C1.C,
+		d.C2.R,
+		d.C2.C,
+	)
 }
 
-var (
-	pageStyle = lipgloss.NewStyle().
-			Padding(1, 2)
+func renderRegionList(g *GameState) string {
+	var b strings.Builder
 
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("230")).
-			Background(lipgloss.Color("29")).
-			Padding(0, 1)
+	for i, region := range g.Puzzle.Regions {
+		b.WriteString(fmt.Sprintf("%02d  ", i+1))
 
-	labelStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("245"))
+		for j, coord := range region.Indices {
+			if len(coord) != 2 {
+				continue
+			}
 
-	mutedStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("241"))
+			if j > 0 {
+				b.WriteString(" ")
+			}
 
-	footerStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("244"))
+			b.WriteString(fmt.Sprintf("r%dc%d", coord[0], coord[1]))
+		}
 
-	cellStyle = lipgloss.NewStyle().
-			Width(7).
-			Height(2).
-			Border(lipgloss.NormalBorder()).
-			BorderForeground(lipgloss.Color("238")).
-			Align(lipgloss.Center)
+		b.WriteString("\n")
+	}
 
-	cursorCellStyle = cellStyle.Copy().
-			BorderForeground(lipgloss.Color("214")).
-			Background(lipgloss.Color("236"))
+	if len(g.Puzzle.Regions) == 0 {
+		b.WriteString(mutedStyle.Render("No regions"))
+	}
 
-	sidePanelStyle = lipgloss.NewStyle().
-			MarginLeft(3).
-			Padding(0, 1).
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("238")).
-			Width(26)
-
-	sideTitleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("230"))
-)
+	return b.String()
+}
