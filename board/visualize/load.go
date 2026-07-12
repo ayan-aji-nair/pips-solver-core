@@ -3,8 +3,6 @@ package visualize
 import (
 	"fmt"
 	"sort"
-
-	"pips-solver/backend/board/types"
 )
 
 func NewGameState(date, difficulty string, p Puzzle) (*GameState, error) {
@@ -78,7 +76,7 @@ func BuildGeometry(p Puzzle) (BoardGeometry, map[Cell]int, error) {
 	}
 
 	if len(existing) == 0 {
-		return BoardGeometry{}, nil, fmt.Errorf()
+		return BoardGeometry{}, nil, fmt.Errorf("not enough dominoes")
 	}
 
 	if len(existing) != 2*len(p.Dominoes) {

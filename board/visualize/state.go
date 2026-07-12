@@ -1,7 +1,5 @@
 package visualize
 
-import "pips-solver/backend/board/types"
-
 type Orientation int
 
 const (
